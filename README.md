@@ -34,8 +34,9 @@ python -m pytest tests/ -v
 - **帧坐标**：所有接口中的坐标均为**原始音频的采样帧坐标**；区间一律**左闭右开** `[start_frame, end_frame)`。
 - **修订号**：创建节目时为 `0`，初始保留全段 `[0, total_frames)`。每次提交保留清单必须带上 `expected_revision`，等于当前修订号才生效，成功后修订号 +1。过期或非法提交会返回原因，旧修订与成品保持原样。
 - **保留清单**：完整替换式语义。各段须非空、升序、不重叠、在音频范围内；每个**必留口播区间**必须完整落入某一个保留段。
+- **旧版建议合入**：客户端拿着旧修订（基版）做出的剪辑建议，可用 `POST /programs/{id}/merges` 合入。服务端在同一次受保护的当前状态上比较**建议、当前修订、基版**三者的保留状态：两侧相对基版改动的帧区间互不重叠才合成新修订；区间相交即返回 `409 merge_conflict` 与冲突区间（**双方都在删同一段也算冲突**，不擅自覆盖）。基版修订不存在、建议清单非法、合并结果不能保证必留口播完整落入单段时，返回原因且当前版本不变。
 - **章节投影**：查询与下载时，章节被换算为成品帧坐标——被删除区间内的章节不再出现；位于保留段**起点**的章节保留（左闭）。换算始终从原始帧出发，反复编辑不会积累偏移。
-- **一致性**：每次成功提交产生一个不可变修订；下载在单个读事务内取定修订快照，同一 ZIP 中的 WAV 与 JSON 必然来自同一修订，并发编辑不会混用版本。并发提交同一 `expected_revision` 时只有一个成功，其余收到 `409 stale_revision`。
+- **一致性**：每次成功提交/合入产生一个不可变修订；合入与提交共用同一把写事务（`BEGIN IMMEDIATE`），「比较 -> 校验 -> 写入」原子完成，并发合入不会丢失任何一方已生效的修改。下载在单个读事务内取定修订快照，同一 ZIP 中的 WAV 与 JSON 必然来自同一修订，并发编辑不会混用版本。并发提交同一 `expected_revision` 时只有一个成功，其余收到 `409 stale_revision`。
 
 ## API 一览
 
@@ -46,9 +47,10 @@ python -m pytest tests/ -v
 | GET | `/programs` | 列出全部节目 |
 | GET | `/programs/{id}` | 查询当前版本（保留段 + 成品帧坐标章节） |
 | PUT | `/programs/{id}/keeps` | 按预期修订号提交完整保留清单 |
+| POST | `/programs/{id}/merges` | 旧版建议三方合入（`base_revision` + 完整保留清单，帧坐标仍指原始音频） |
 | GET | `/programs/{id}/download` | 下载 ZIP（`audio.wav` + `chapters.json`） |
 
-错误统一返回 JSON：`{"error": <代码>, "message": <中文原因>, ...}`，状态码为 400（参数非法）/ 404（不存在）/ 409（修订号过期）。
+错误统一返回 JSON：`{"error": <代码>, "message": <中文原因>, ...}`，状态码为 400（参数非法 / 合入结果违反必留口播）/ 404（节目或基版修订不存在）/ 409（修订号过期或合入冲突）。
 
 ## 可执行的调用示例
 
@@ -118,6 +120,61 @@ unzip -o program-$PID-rev1.zip   # 得到 audio.wav 与 chapters.json
 - `audio.wav`：按保留段真正裁接后的成品（16 kHz / 单声道 / 16 位，帧数等于保留段总长）。
 - `chapters.json`：同一修订的章节表，`start_frame` 为成品帧坐标。
 
+### 5. 旧版建议合入（三方合入）
+
+接着第 3 步后的状态：当前为**修订 1**，已删 `[32000,48000)` 与 `[96000,112000)`。假设一个旧客户端仍基于**修订 0** 做了剪辑，想删 `[128000,144000)`（帧坐标仍指原始音频）。该区间与当前侧改动互不重叠，可以合入：
+
+```bash
+curl -s -X POST http://localhost:8000/programs/$PID/merges \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":0,
+       "keep_segments":[{"start_frame":0,"end_frame":128000},
+                        {"start_frame":144000,"end_frame":160000}]}'
+```
+
+响应 `200`，`revision` 变为 `2`，两侧删除同时保留：
+
+```json
+{"revision":2,
+ "keep_segments":[
+   {"start_frame":0,"end_frame":32000},
+   {"start_frame":48000,"end_frame":96000},
+   {"start_frame":112000,"end_frame":128000},
+   {"start_frame":144000,"end_frame":160000}],
+ ...}
+```
+
+此后 `GET /programs/$PID` 的章节投影与 `GET /programs/$PID/download` 的 ZIP（文件名也变为 `program-$PID-rev2.zip`）都反映修订 2 的同一音频与章节。
+
+建议删除区与当前删除区**相交**时（示例相交于 `[40000,48000)`）返回 `409 merge_conflict` 与冲突区间，当前版本保持不变：
+
+```bash
+curl -s -X POST http://localhost:8000/programs/$PID/merges \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":0,
+       "keep_segments":[{"start_frame":0,"end_frame":40000},
+                        {"start_frame":56000,"end_frame":160000}]}'
+# => {"base_revision":0,"current_revision":2,"error":"merge_conflict",
+#     "conflicts":[{"start_frame":40000,"end_frame":48000}], ...}
+```
+
+注意：即使建议与当前修订**删的是完全相同的一段**，响应同样是 `409 merge_conflict`（冲突区间即该段），服务端不会擅自当成一致而覆盖。冲突后需重新 `GET` 当前版本、基于新修订重新生成建议再合入。
+
+其它拒绝情形（均不改变当前版本）：
+
+```bash
+# 基版修订不存在 -> 404 base_revision_not_found
+curl -s -X POST http://localhost:8000/programs/$PID/merges \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":99,
+       "keep_segments":[{"start_frame":0,"end_frame":160000}]}'
+
+# 建议清单非法（段重叠/未升序/越界等）-> 400 invalid_segments
+# 合并结果使必留口播 [16000,32000) 无法完整落入单段 -> 400 must_keep_uncovered
+```
+
+两个并发合入各自删除互不相交的区间时，服务端在同一把写事务内完成「比较 → 校验 → 写入」，两处删除都会生效（各产生一个修订号），不会有一方的修改丢失。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -129,7 +186,7 @@ unzip -o program-$PID-rev1.zip   # 得到 audio.wav 与 chapters.json
 
 ```
 app.py               # 全部 API 与核心逻辑（校验、章节投影、裁接、打包）
-tests/test_app.py    # pytest 测试（规格校验、投影、并发修订、下载一致性、持久化）
+tests/test_app.py    # pytest 测试（规格校验、投影、提交/三方合入、冲突、并发不丢修改、下载一致性、持久化）
 requirements.txt     # flask + gunicorn
 Dockerfile           # python:3.12-slim + gunicorn
 docker-compose.yml   # 单条命令启动，卷持久化

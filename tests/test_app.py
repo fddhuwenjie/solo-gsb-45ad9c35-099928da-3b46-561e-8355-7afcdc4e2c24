@@ -9,6 +9,7 @@ import math
 import os
 import struct
 import tempfile
+import threading
 import wave
 import zipfile
 
@@ -337,3 +338,257 @@ def test_unknown_program_404(client):
     assert client.put("/programs/nope/keeps",
                       json={"expected_revision": 0, "keep_segments": []}).status_code == 404
     assert client.get("/programs/nope/download").status_code == 404
+
+
+# ---- 旧版建议合入（三方合入）---------------------------------------------------
+def _merge(client, pid, base, segments):
+    return client.post(f"/programs/{pid}/merges", json={
+        "base_revision": base,
+        "keep_segments": segments,
+    })
+
+
+def _setup_two_branches(client):
+    """基版修订 0 全保留；修订 1 由当前用户删去 [32000,48000)。
+
+    旧版建议仍以修订 0 为依据，可删与之不相交的其它区间。
+    """
+    pid = _make_program(client)
+    r1 = client.put(f"/programs/{pid}/keeps", json={
+        "expected_revision": 0,
+        "keep_segments": [
+            {"start_frame": 0, "end_frame": 32000},
+            {"start_frame": 48000, "end_frame": 160000},
+        ],
+    })
+    assert r1.status_code == 200 and r1.get_json()["revision"] == 1
+    return pid
+
+
+def test_merge_disjoint_changes_synthesizes_revision(client):
+    pid = _setup_two_branches(client)
+    # 建议（依据修订 0）删去 [96000,112000)，与当前已删的 [32000,48000) 互不相交
+    resp = _merge(client, pid, 0, [
+        {"start_frame": 0, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 160000},
+    ])
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["revision"] == 2
+    assert body["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 160000},
+    ]
+    assert body["product_frames"] == 32000 + 48000 + 48000
+    # 章节查询反映合并后的同一修订：c5=120000 落在 [112000,160000)
+    proj = {c["title"]: c["product_start_frame"] for c in body["chapters"]}
+    assert proj["c5"] == 32000 + 48000 + (120000 - 112000)
+    assert "c1" not in proj  # 40000 落在当前侧删除区
+
+
+def test_merge_seen_after_get_and_download(client):
+    pid = _setup_two_branches(client)
+    merged_segments = [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 160000},
+    ]
+    assert _merge(client, pid, 0, [
+        {"start_frame": 0, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 160000},
+    ]).status_code == 200
+
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 2 and cur["keep_segments"] == merged_segments
+
+    zf = zipfile.ZipFile(io.BytesIO(client.get(f"/programs/{pid}/download").data))
+    with wave.open(io.BytesIO(zf.read("audio.wav")), "rb") as w:
+        wav_frames = w.getnframes()
+    doc = json.loads(zf.read("chapters.json"))
+    assert doc["revision"] == 2
+    assert wav_frames == doc["product_frames"] == 32000 + 48000 + 48000
+    starts = {c["title"]: c["start_frame"] for c in doc["chapters"]}
+    assert starts["c5"] == 32000 + 48000 + 8000
+
+
+def test_merge_overlapping_changes_conflict_409(client):
+    pid = _setup_two_branches(client)
+    # 建议删 [40000,56000)，与当前删除 [32000,48000) 相交于 [40000,48000)
+    resp = _merge(client, pid, 0, [
+        {"start_frame": 0, "end_frame": 40000},
+        {"start_frame": 56000, "end_frame": 160000},
+    ])
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body["error"] == "merge_conflict"
+    assert body["base_revision"] == 0
+    assert body["current_revision"] == 1
+    assert body["conflicts"] == [{"start_frame": 40000, "end_frame": 48000}]
+    # 当前版本不变
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 1
+    assert cur["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 160000},
+    ]
+
+
+def test_merge_both_sides_delete_same_segment_is_conflict(client):
+    pid = _setup_two_branches(client)
+    # 建议清单与当前修订完全相同：双方相对基版都删了 [32000,48000)，不能擅自视为一致
+    resp = _merge(client, pid, 0, [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 160000},
+    ])
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body["error"] == "merge_conflict"
+    assert body["conflicts"] == [{"start_frame": 32000, "end_frame": 48000}]
+    assert client.get(f"/programs/{pid}").get_json()["revision"] == 1
+
+
+def test_merge_adjacent_but_disjoint_changes_ok(client):
+    pid = _setup_two_branches(client)
+    # 当前删 [32000,48000)；建议删 [16000,32000)——仅相邻、帧区间不相交
+    resp = _merge(client, pid, 0, [
+        {"start_frame": 0, "end_frame": 16000},
+        {"start_frame": 32000, "end_frame": 160000},
+    ])
+    assert resp.status_code == 200
+    assert resp.get_json()["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 16000},
+        {"start_frame": 48000, "end_frame": 160000},
+    ]
+
+
+def test_merge_base_revision_missing_404(client):
+    pid = _setup_two_branches(client)
+    resp = _merge(client, pid, 7, [
+        {"start_frame": 0, "end_frame": 160000},
+    ])
+    assert resp.status_code == 404
+    assert resp.get_json()["error"] == "base_revision_not_found"
+    assert resp.get_json()["current_revision"] == 1
+    assert client.get(f"/programs/{pid}").get_json()["revision"] == 1
+
+
+def test_merge_bad_base_revision_field_400(client):
+    pid = _setup_two_branches(client)
+    resp = client.post(f"/programs/{pid}/merges", json={
+        "base_revision": "0",
+        "keep_segments": [{"start_frame": 0, "end_frame": 160000}],
+    })
+    assert resp.status_code == 400 and resp.get_json()["error"] == "invalid_base_revision"
+
+    resp = client.post(f"/programs/{pid}/merges", json={
+        "keep_segments": [{"start_frame": 0, "end_frame": 160000}],
+    })
+    assert resp.status_code == 400 and resp.get_json()["error"] == "missing_base_revision"
+    assert client.get(f"/programs/{pid}").get_json()["revision"] == 1
+
+
+def test_merge_invalid_suggested_segments_400(client):
+    pid = _setup_two_branches(client)
+    resp = _merge(client, pid, 0, [
+        {"start_frame": 0, "end_frame": 60000},
+        {"start_frame": 59000, "end_frame": 70000},  # 重叠、非升序
+    ])
+    assert resp.status_code == 400 and resp.get_json()["error"] == "invalid_segments"
+
+    resp = _merge(client, pid, 0, [{"start_frame": -1, "end_frame": 100}])
+    assert resp.status_code == 400 and resp.get_json()["error"] == "invalid_segments"
+
+    resp = client.post(f"/programs/{pid}/merges",
+                       data="not-json", content_type="application/json")
+    assert resp.status_code == 400 and resp.get_json()["error"] == "invalid_json"
+    assert client.get(f"/programs/{pid}").get_json()["revision"] == 1
+
+
+def test_merge_result_must_cover_must_keep_400(client):
+    pid = _setup_two_branches(client)
+    # 必留口播 [50000,60000)；建议删 [48000,96000)，与当前删除不相交，
+    # 但合并结果把口播整段删掉 -> 拒绝，当前版本不变
+    resp = _merge(client, pid, 0, [
+        {"start_frame": 0, "end_frame": 48000},
+        {"start_frame": 96000, "end_frame": 160000},
+    ])
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert body["error"] == "must_keep_uncovered"
+    assert body["must_keep"] == {"start_frame": 50000, "end_frame": 60000}
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 1
+
+
+def test_merge_against_nonzero_base_with_independent_followups(client):
+    pid = _setup_two_branches(client)
+    # 再以修订 1 为基版：当前侧（修订 2）删 [96000,112000)，建议侧删 [120000,130000)
+    assert client.put(f"/programs/{pid}/keeps", json={
+        "expected_revision": 1,
+        "keep_segments": [
+            {"start_frame": 0, "end_frame": 32000},
+            {"start_frame": 48000, "end_frame": 96000},
+            {"start_frame": 112000, "end_frame": 160000},
+        ],
+    }).status_code == 200
+    resp = _merge(client, pid, 1, [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 120000},
+        {"start_frame": 130000, "end_frame": 160000},
+    ])
+    assert resp.status_code == 200
+    assert resp.get_json()["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 120000},
+        {"start_frame": 130000, "end_frame": 160000},
+    ]
+
+
+def test_merge_unknown_program_404(client):
+    assert client.post("/programs/nope/merges", json={
+        "base_revision": 0,
+        "keep_segments": [{"start_frame": 0, "end_frame": 100}],
+    }).status_code == 404
+
+
+def test_concurrent_merges_both_take_effect(client):
+    """两个并发合入都基于修订 0、删除互不相交的区间：串行化后两处删除都生效。"""
+    pid = _make_program(client)  # 必留口播 [50000,60000)
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def merge_a():
+        with app_module.app.test_client() as c:
+            barrier.wait()
+            results["a"] = _merge(c, pid, 0, [
+                {"start_frame": 0, "end_frame": 16000},
+                {"start_frame": 32000, "end_frame": 160000},
+            ])
+
+    def merge_b():
+        with app_module.app.test_client() as c:
+            barrier.wait()
+            results["b"] = _merge(c, pid, 0, [
+                {"start_frame": 0, "end_frame": 96000},
+                {"start_frame": 112000, "end_frame": 160000},
+            ])
+
+    t1, t2 = threading.Thread(target=merge_a), threading.Thread(target=merge_b)
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert results["a"].status_code == 200, results["a"].status
+    assert results["b"].status_code == 200, results["b"].status
+    assert {results["a"].get_json()["revision"],
+            results["b"].get_json()["revision"]} == {1, 2}
+
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 2
+    # 两处删除 [16000,32000) 与 [96000,112000) 都在最终修订中
+    assert cur["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 16000},
+        {"start_frame": 32000, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 160000},
+    ]
+    assert cur["product_frames"] == 16000 + 64000 + 48000

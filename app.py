@@ -7,6 +7,10 @@
   各段左闭右开、非空、升序、不重叠且在音频范围内，必留口播须完整落入某个保留段。
 - 查询当前版本：返回保留段与换算为成品帧坐标的章节
   （被删除区间内的章节消失，位于保留段起点的章节保留；始终按原始帧计算，不积累偏移）。
+- 旧版建议合入：提交建议依据的基版修订号与完整保留清单，三方（建议 / 当前 / 基版）
+  比较保留状态；两侧改动的帧区间互不重叠才合成新修订，区间相交即返回冲突区间
+  （双方都删同一段也算冲突，不擅自覆盖），基版不存在、清单非法或合入结果违反
+  必留口播完整落入单段时拒绝，当前版本保持不变。
 - 下载 ZIP：包含真正裁接好的 WAV 与 JSON 章节表，
   两者取自同一修订的不可变快照，并发编辑不会混用版本。
 - 所有状态存于 SQLite，重启后仍可继续编辑节目。
@@ -325,6 +329,88 @@ def build_product_wav(wav_bytes, segments):
     return buf.getvalue()
 
 
+# ---- 三方合入 ----------------------------------------------------------------
+def _contains(segments, point):
+    """有序、不重叠的保留段是否包含该帧。"""
+    for s, e in segments:
+        if s <= point < e:
+            return True
+        if s > point:
+            break
+    return False
+
+
+def _symmetric_difference(a, b, total_frames):
+    """两份保留清单保留状态不同的帧区间（按帧的集合对称差），结果已规整为升序非空段。"""
+    points = {0, total_frames}
+    for s, e in a + b:
+        points.add(s)
+        points.add(e)
+    points = sorted(points)
+    diffs = []
+    for x, y in zip(points, points[1:]):
+        # 单元 [x, y) 内任何帧的归属都一致，取左端点判定即可
+        if _contains(a, x) != _contains(b, x):
+            diffs.append((x, y))
+    return _coalesce(diffs)
+
+
+def _coalesce(segments):
+    """合并相邻（右端 == 下一段左端）的升序区间。"""
+    out = []
+    for s, e in segments:
+        if out and out[-1][1] == s:
+            out[-1] = (out[-1][0], e)
+        else:
+            out.append((s, e))
+    return out
+
+
+def _intersect(a, b):
+    """两个升序、不重叠区间集的交集。"""
+    i = j = 0
+    out = []
+    while i < len(a) and j < len(b):
+        s = max(a[i][0], b[j][0])
+        e = min(a[i][1], b[j][1])
+        if s < e:
+            out.append((s, e))
+        if a[i][1] <= b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out
+
+
+def three_way_merge(base, theirs, current, total_frames):
+    """三方合入：基版 base、建议 theirs、当前 current（均为原始帧坐标的保留段）。
+
+    帧在某一侧「被改动」定义为该侧与基版的保留状态不同。两侧改动区间相交即冲突
+    （含双方都删/改同一段）；互不重叠时，改动的帧取改动方状态，未改动的帧维持基版。
+    返回 (合并保留段, 冲突区间)；冲突时保留段为 None。
+    """
+    changed_theirs = _symmetric_difference(base, theirs, total_frames)
+    changed_current = _symmetric_difference(base, current, total_frames)
+    conflicts = _coalesce(_intersect(changed_theirs, changed_current))
+    if conflicts:
+        return None, conflicts
+
+    points = sorted({0, total_frames}
+                    | {p for seg in theirs + current + base for p in seg})
+    merged = []
+    for x, y in zip(points, points[1:]):
+        in_theirs = _contains(theirs, x)
+        in_current = _contains(current, x)
+        in_base = _contains(base, x)
+        # 两侧改动不相交，故同一帧至多一侧与基版不同；都未改动则沿用基版。
+        kept = in_theirs if in_theirs != in_base else (
+            in_current if in_current != in_base else in_base
+        )
+        if kept:
+            merged.append((x, y))
+    return _coalesce(merged), []
+
+
 # ---- 数据访问 -----------------------------------------------------------------
 def _fetch_program(db, pid):
     row = db.execute("SELECT * FROM programs WHERE id = ?", (pid,)).fetchone()
@@ -496,6 +582,90 @@ def put_keeps(pid):
             "INSERT INTO revision_segments (program_id, revision, idx, start_frame, end_frame)"
             " VALUES (?,?,?,?,?)",
             [(pid, new_revision, i, s, e) for i, (s, e) in enumerate(segments)],
+        )
+        db.execute(
+            "UPDATE programs SET current_revision = ? WHERE id = ?", (new_revision, pid)
+        )
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+    row = _fetch_program(db, pid)
+    return jsonify(_program_payload(db, row))
+
+
+@app.post("/programs/<pid>/merges")
+def merge_keeps(pid):
+    """旧版剪辑建议合入：以 base_revision 为共同基版做三方合入。
+
+    建议、当前修订、基版的「比较 -> 校验 -> 写入」在同一个 BEGIN IMMEDIATE
+    事务内完成，因此并发合入/提交看到的都是受保护的当前状态，
+    已生效的修改不会被后来者基于旧状态覆盖丢失。
+    """
+    body = request.get_json(silent=True)
+    if body is None:
+        raise ApiError(400, "invalid_json", "请求体必须为 JSON（Content-Type: application/json）")
+    if "base_revision" not in body:
+        raise ApiError(400, "missing_base_revision", "缺少字段 base_revision（建议所依据的既有修订号）")
+    base_revision = body["base_revision"]
+    if not _is_int(base_revision) or base_revision < 0:
+        raise ApiError(400, "invalid_base_revision", "base_revision 必须为非负整数")
+    if "keep_segments" not in body:
+        raise ApiError(400, "missing_keep_segments", "缺少字段 keep_segments（完整保留清单）")
+    raw_segments = body["keep_segments"]
+
+    db = get_db()
+    # 与 PUT 同一把写锁：基版比较、清单校验、冲突计算与新修订写入是原子的。
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = _fetch_program(db, pid)
+        total_frames = row["total_frames"]
+        current = row["current_revision"]
+
+        base_exists = db.execute(
+            "SELECT 1 FROM revisions WHERE program_id = ? AND revision = ?",
+            (pid, base_revision),
+        ).fetchone()
+        if base_exists is None:
+            raise ApiError(
+                404, "base_revision_not_found",
+                f"基版修订号 {base_revision} 不存在；当前修订号为 {current}，本次合入未生效",
+                base_revision=base_revision,
+                current_revision=current,
+            )
+
+        base_segments = _fetch_segments(db, pid, base_revision)
+        current_segments = _fetch_segments(db, pid, current)
+        # 建议清单非法：结构性校验失败即拒绝（左闭右开、非空、升序、不重叠、在音频内）
+        suggested_segments = validate_keep_segments(raw_segments, total_frames)
+
+        merged, conflicts = three_way_merge(
+            base_segments, suggested_segments, current_segments, total_frames
+        )
+        if conflicts:
+            raise ApiError(
+                409, "merge_conflict",
+                "建议与当前修订相对于基版改动了相交的帧区间，本次合入未生效；"
+                "请拉取当前版本后重新生成建议（双方同时删除同一段也视为冲突）",
+                base_revision=base_revision,
+                current_revision=current,
+                conflicts=[{"start_frame": s, "end_frame": e} for s, e in conflicts],
+            )
+
+        must_keeps = _fetch_must_keeps(db, pid)
+        check_must_keeps_covered(must_keeps, merged)
+
+        new_revision = current + 1
+        now = datetime.now(timezone.utc).isoformat()
+        db.execute(
+            "INSERT INTO revisions (program_id, revision, created_at) VALUES (?,?,?)",
+            (pid, new_revision, now),
+        )
+        db.executemany(
+            "INSERT INTO revision_segments (program_id, revision, idx, start_frame, end_frame)"
+            " VALUES (?,?,?,?,?)",
+            [(pid, new_revision, i, s, e) for i, (s, e) in enumerate(merged)],
         )
         db.execute(
             "UPDATE programs SET current_revision = ? WHERE id = ?", (new_revision, pid)
