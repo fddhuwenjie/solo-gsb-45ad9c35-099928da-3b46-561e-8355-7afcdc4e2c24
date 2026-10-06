@@ -9,6 +9,9 @@
   （被删除区间内的章节消失，位于保留段起点的章节保留；始终按原始帧计算，不积累偏移）。
 - 下载 ZIP：包含真正裁接好的 WAV 与 JSON 章节表，
   两者取自同一修订的不可变快照，并发编辑不会混用版本。
+- 合入旧版剪辑建议：给出建议依据的既有修订号与完整保留清单（坐标仍指原始音频），
+  以该修订为共同基版做三方比较；建议与当前修订相对基版的改动帧区间互不相交时
+  合成新修订，相交即返回冲突区间（即使双方都在删同一段也不擅自覆盖）。
 - 所有状态存于 SQLite，重启后仍可继续编辑节目。
 """
 
@@ -284,6 +287,54 @@ def check_must_keeps_covered(must_keeps, segments):
             )
 
 
+# ---- 三方合入 ----------------------------------------------------------------
+def merge_intervals(intervals):
+    """合并相交或首尾相接的区间，输入可为任意顺序，返回升序不重叠区间。"""
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def three_way_merge(base, current, suggested, total_frames):
+    """按共同基版比较建议与当前两份保留状态的改动。
+
+    返回 (merged, conflicts)，均为升序、不重叠且首尾相接已合并的区间列表：
+    - 用三份区间集合的全部端点把 [0, total_frames) 切成原子段，
+      原子段内 base/current/suggested 的保留状态恒定；
+    - 两侧相对基版都改了同一原子段（无论改成保留还是删除，也无论是否同向）
+      即为冲突，绝不擅自取舍；
+    - 恰有一侧改动时采纳该侧；两侧都没改时沿用基版。
+    """
+    boundaries = {0, total_frames}
+    for segs in (base, current, suggested):
+        for start, end in segs:
+            boundaries.add(start)
+            boundaries.add(end)
+    points = sorted(boundaries)
+
+    def kept(segs, frame):
+        # segs 升序不重叠；segments 数量很少，直接判定即可
+        return any(s <= frame < e for s, e in segs)
+
+    merged_atoms = []
+    conflict_atoms = []
+    for a, b in zip(points, points[1:]):
+        bk, ck, sk = kept(base, a), kept(current, a), kept(suggested, a)
+        cur_changed = ck != bk
+        sug_changed = sk != bk
+        if cur_changed and sug_changed:
+            conflict_atoms.append((a, b))
+        else:
+            # 一侧改动则采纳该侧；都没改则 ck == sk == bk
+            if ck if cur_changed else (sk if sug_changed else bk):
+                merged_atoms.append((a, b))
+    return merge_intervals(merged_atoms), merge_intervals(conflict_atoms)
+
+
 # ---- 核心换算 ----------------------------------------------------------------
 def project_chapters(chapters, segments):
     """把原始帧坐标的章节换算为成品帧坐标。
@@ -496,6 +547,88 @@ def put_keeps(pid):
             "INSERT INTO revision_segments (program_id, revision, idx, start_frame, end_frame)"
             " VALUES (?,?,?,?,?)",
             [(pid, new_revision, i, s, e) for i, (s, e) in enumerate(segments)],
+        )
+        db.execute(
+            "UPDATE programs SET current_revision = ? WHERE id = ?", (new_revision, pid)
+        )
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+    row = _fetch_program(db, pid)
+    return jsonify(_program_payload(db, row))
+
+
+@app.post("/programs/<pid>/merges")
+def merge_keeps(pid):
+    """合入一份基于既有修订（共同基版）的旧版剪辑建议。"""
+    body = request.get_json(silent=True)
+    if body is None:
+        raise ApiError(400, "invalid_json", "请求体必须为 JSON（Content-Type: application/json）")
+    if "base_revision" not in body:
+        raise ApiError(400, "missing_base_revision", "缺少字段 base_revision（建议依据的既有修订号）")
+    base_revision = body["base_revision"]
+    if not _is_int(base_revision) or base_revision < 0:
+        raise ApiError(400, "invalid_base_revision", "base_revision 必须为非负整数")
+    if "keep_segments" not in body:
+        raise ApiError(400, "missing_keep_segments", "缺少字段 keep_segments（完整保留清单）")
+
+    db = get_db()
+    # 与普通提交同一个 BEGIN IMMEDIATE 写锁：基版/当前状态读取、三方比较、
+    # 必留校验与新修订写入在同一个受保护的当前状态上完成，
+    # 并发合入（或与 PUT 并发）会被串行化，已生效修改不会丢失。
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = _fetch_program(db, pid)
+        total_frames = row["total_frames"]
+        current = row["current_revision"]
+
+        # 基版必须是真实存在的历史修订；不存在则不写入任何内容。
+        exists = db.execute(
+            "SELECT 1 FROM revisions WHERE program_id = ? AND revision = ?",
+            (pid, base_revision),
+        ).fetchone()
+        if exists is None:
+            raise ApiError(
+                404, "base_revision_not_found",
+                f"基版修订号 {base_revision} 不存在；当前修订号为 {current}，本次合入未生效",
+                current_revision=current,
+            )
+
+        base_segments = _fetch_segments(db, pid, base_revision)
+        current_segments = _fetch_segments(db, pid, current)
+        suggested_segments = validate_keep_segments(body["keep_segments"], total_frames)
+
+        merged_segments, conflicts = three_way_merge(
+            base_segments, current_segments, suggested_segments, total_frames
+        )
+
+        if conflicts:
+            # 两侧改动的帧区间相交即为冲突——哪怕双方都在删同一段，
+            # 也不擅自覆盖，交给调用方重新协商。
+            raise ApiError(
+                409, "merge_conflict",
+                f"建议与当前修订相对基版 {base_revision} 在 {len(conflicts)} 个帧区间上同时改动，"
+                "无法自动合入；冲突区间内双方改动相交（含双方删除同一段），本次合入未生效",
+                base_revision=base_revision,
+                current_revision=current,
+                conflicts=[{"start_frame": s, "end_frame": e} for s, e in conflicts],
+            )
+
+        must_keeps = _fetch_must_keeps(db, pid)
+        check_must_keeps_covered(must_keeps, merged_segments)
+
+        new_revision = current + 1
+        now = datetime.now(timezone.utc).isoformat()
+        db.execute(
+            "INSERT INTO revisions (program_id, revision, created_at) VALUES (?,?,?)",
+            (pid, new_revision, now),
+        )
+        db.executemany(
+            "INSERT INTO revision_segments (program_id, revision, idx, start_frame, end_frame)"
+            " VALUES (?,?,?,?,?)",
+            [(pid, new_revision, i, s, e) for i, (s, e) in enumerate(merged_segments)],
         )
         db.execute(
             "UPDATE programs SET current_revision = ? WHERE id = ?", (new_revision, pid)

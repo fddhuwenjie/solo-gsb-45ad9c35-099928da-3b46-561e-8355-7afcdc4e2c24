@@ -35,7 +35,8 @@ python -m pytest tests/ -v
 - **修订号**：创建节目时为 `0`，初始保留全段 `[0, total_frames)`。每次提交保留清单必须带上 `expected_revision`，等于当前修订号才生效，成功后修订号 +1。过期或非法提交会返回原因，旧修订与成品保持原样。
 - **保留清单**：完整替换式语义。各段须非空、升序、不重叠、在音频范围内；每个**必留口播区间**必须完整落入某一个保留段。
 - **章节投影**：查询与下载时，章节被换算为成品帧坐标——被删除区间内的章节不再出现；位于保留段**起点**的章节保留（左闭）。换算始终从原始帧出发，反复编辑不会积累偏移。
-- **一致性**：每次成功提交产生一个不可变修订；下载在单个读事务内取定修订快照，同一 ZIP 中的 WAV 与 JSON 必然来自同一修订，并发编辑不会混用版本。并发提交同一 `expected_revision` 时只有一个成功，其余收到 `409 stale_revision`。
+- **三方合入旧版建议**：旧剪辑端基于某个**既有修订**（共同基版，`base_revision`）给出完整保留建议时，服务同时比较「建议 / 当前修订 / 共同基版」的保留状态。两侧**相对基版的改动帧区间互不相交**才合成新修订；只要相交即返回 `409 merge_conflict` 与冲突区间——**即使双方都在删同一段（同向改动）也不擅自覆盖**。仅一侧改动的帧采纳该侧，都未改动的帧沿用基版。基版不存在、建议清单非法或合并结果不满足必留口播完整落入单段时，返回原因且当前版本保持不变。
+- **一致性**：每次成功提交（含合入）产生一个不可变修订；下载在单个读事务内取定修订快照，同一 ZIP 中的 WAV 与 JSON 必然来自同一修订，并发编辑不会混用版本。并发提交同一 `expected_revision` 时只有一个成功，其余收到 `409 stale_revision`。合入与普通提交共用同一把写锁（`BEGIN IMMEDIATE`），比较、校验、写入基于同一次受保护的当前状态，并发合入串行生效、互不丢修改。
 
 ## API 一览
 
@@ -46,9 +47,10 @@ python -m pytest tests/ -v
 | GET | `/programs` | 列出全部节目 |
 | GET | `/programs/{id}` | 查询当前版本（保留段 + 成品帧坐标章节） |
 | PUT | `/programs/{id}/keeps` | 按预期修订号提交完整保留清单 |
+| POST | `/programs/{id}/merges` | 以既有修订为共同基版，三方合入旧版剪辑建议 |
 | GET | `/programs/{id}/download` | 下载 ZIP（`audio.wav` + `chapters.json`） |
 
-错误统一返回 JSON：`{"error": <代码>, "message": <中文原因>, ...}`，状态码为 400（参数非法）/ 404（不存在）/ 409（修订号过期）。
+错误统一返回 JSON：`{"error": <代码>, "message": <中文原因>, ...}`，状态码为 400（参数非法/必留口播未落入单段）/ 404（节目或基版修订不存在）/ 409（修订号过期或合入冲突）。
 
 ## 可执行的调用示例
 
@@ -118,6 +120,39 @@ unzip -o program-$PID-rev1.zip   # 得到 audio.wav 与 chapters.json
 - `audio.wav`：按保留段真正裁接后的成品（16 kHz / 单声道 / 16 位，帧数等于保留段总长）。
 - `chapters.json`：同一修订的章节表，`start_frame` 为成品帧坐标。
 
+### 5. 合入旧版剪辑建议（三方合并）
+
+旧剪辑端仍基于**修订 0** 工作：它不知道主版本已在第 3 步删了 `[32000,48000)` 与 `[96000,112000)`，只按自己的需要建议删去主版本尚未触碰的 `[128000,144000)`。两侧相对基版 0 的改动不相交，合入成功并生成**修订 2**：
+
+```bash
+curl -s -X POST http://localhost:8000/programs/$PID/merges \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":0,
+       "keep_segments":[{"start_frame":0,"end_frame":128000},
+                        {"start_frame":144000,"end_frame":160000}]}'
+# => revision 2，保留段为 [0,32000) [48000,96000) [112000,128000) [144000,160000)，
+#    主版本与建议侧三处删除都保留；必留口播 [16000,32000) 仍完整落入单段
+```
+
+响应与 `GET /programs/{id}` 结构相同（新修订号 + 合并后的保留段、章节投影、必留口播）。随后的章节查询与 ZIP 下载即反映合并后的同一修订。
+
+冲突示例：另一份同样基于修订 0 的旧建议也要动主版本已改的区间（此处建议删 `[40000,48000)`，与主版本的删除区间 `[32000,48000)` 相交；**双方都在删同段也算冲突，不会自动取舍**），返回 `409` 与冲突区间，当前版本保持不变：
+
+```bash
+curl -s -X POST http://localhost:8000/programs/$PID/merges \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":0,
+       "keep_segments":[{"start_frame":0,"end_frame":40000},
+                        {"start_frame":48000,"end_frame":160000}]}'
+# => 409 {"error":"merge_conflict",
+#         "base_revision":0,"current_revision":2,
+#         "conflicts":[{"start_frame":40000,"end_frame":48000}], ...}
+```
+
+其他不生效的情况：`base_revision` 不是历史修订时返回 `404 base_revision_not_found`；建议清单本身非法（空段/越界/未升序等）返回 `400 invalid_segments`；合并后某段必留口播无法完整落入单一保留段时返回 `400 must_keep_uncovered`。三者均不产生新修订。
+
+注意：普通的 `PUT /programs/{id}/keeps` 语义不变——它只校验 `expected_revision == 当前修订号`，对过期修订仍返回 `409 stale_revision`；合入是独立的新接口。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -129,7 +164,7 @@ unzip -o program-$PID-rev1.zip   # 得到 audio.wav 与 chapters.json
 
 ```
 app.py               # 全部 API 与核心逻辑（校验、章节投影、裁接、打包）
-tests/test_app.py    # pytest 测试（规格校验、投影、并发修订、下载一致性、持久化）
+tests/test_app.py    # pytest 测试（规格校验、投影、并发修订、三方合入、下载一致性、持久化）
 requirements.txt     # flask + gunicorn
 Dockerfile           # python:3.12-slim + gunicorn
 docker-compose.yml   # 单条命令启动，卷持久化
